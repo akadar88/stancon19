@@ -446,15 +446,15 @@ Re-fit with tighter/more sensible priors for the random effects' standard deviat
 ```{r}
 prior2 <- get_prior(formula1,
                    data = subset2model, 
-                   family = gaussian())
-# prior$prior[1] <- "normal(0,1)"
-# prior$prior[2] <- "normal(0,1)"
-prior2$prior[c(1,2,3,4,5,6,7)] <- "normal(0,0.1)"
+                   family = lognormal())
+# prior2$prior[1] <- "normal(0,1)"
+# prior2$prior[2] <- "normal(0,1)"
+prior2$prior[c(1)] <- "normal(1, 0.01)"
 prior2
 
 fit2 <- brm(formula = formula1, 
             data = subset2model, 
-            family = gaussian(),
+            family = lognormal(),
             prior = prior2,
             warmup = 500, iter = 1000,
             control = list(adapt_delta = 0.95))

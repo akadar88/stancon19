@@ -1,0 +1,563 @@
+---
+title: "Stancon notebook"
+author: "András Kádár"
+date: '2019 augusztus 13'
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+```
+
+## Introduction
+
+Closely related to the spread of renewable energy capacities one urging task is to accurately forecast their energy production. Without digging deep into the European regulation of renewable energy suppliers the following principle is followed in general: even small or middle-sized capacity owners are obliged to give predictions of their units’ energy input to the local electrical grid. In case of solar panels with systemic importance due to their sizes or their contribution to the local energy mix this need is even more pronounced. In certain countries large producers may even be fined with a significant amount of money if their production levels are way off their prognosis.
+
+This notebook presents an anonymized dataset of photovoltaic solar panels and presents some simpler models which aim at predicting the one-day-ahead production of the panels.
+  
+This kind of forecasting problem has previously proved to be challenging mainly due to the following reasons:  
+  
+  - lack of high quality weather prognosis;
+  - the need for production forecast with high resolution (both in time and space domain);
+  - the relatively long forecast horizon.  
+  
+Although, solar systems are unique with respect to **i)** their direct use of the Sun’s energy, **ii)** their quasi-deterministic periodicity (annual and daily cycles) and **iii)** upper bound with respect to their theoretical production capabilities, the above mentioned factors are influential for them as well.
+
+*After a brief discussion of our assumptions we present and explore the dataset we have. Then we try out some possible configurations that can be consistent with the problem at hand and do model comparison based on their predictive performance.*
+
+## Problem and data at hand
+
+We need to provide one-day-ahead high resolution (15 min) forecasts for each panel’s energy production. We have several panels spread over a relatively large area for which we have around one year of past production data with the required temporal resolution (15 min).  
+  
+To tame our problem at hand we will begin with some **simplifying assumptions**. The most important ones:  
+
+
+  1. First of all, we will assume that in every time period the intensity of solar irradiance arriving at the panel under clear sky conditions can be determined without error. This implies several further simplifying assumptions (e.g. precisely known and fixed tilt angle and orientation of the panel). 
+  2. Second, we will only model direct solar irradiance explicitly. 
+  3. Third, besides cloud cover, other weather-related variables (e.g. temperature, wind speed, etc.) are not modelled explicitly albeit their known (but non-trivial) influence on the panels' electricity production. 
+  4. Lastly, panel specific physical parameters (e.g. efficiency under certain conditions) are not explicitly included in the model.  
+  
+
+### Data
+
+1. We have scraped one-day-ahead high resolution forecasts of cloud cover specific to the exact geographical position of the panel.  
+2. We calculated the solar irradiance intensity (measured in kw/m2) based on the deterministic irradiance equations (detailed derivation in *http://www.pveducation.org/pvcdrom/properties-of-sunlight/arbitrary-orientation-and-tilt * and implementation in *https://github.com/mlguys/ShinySolarCalculator/blob/master/R/suncalculator.R *). We normalized it to range from 0 to 1.  
+  
+In combination with the available anonymized production data this gives us a long database with a rich structure relative to the (small) number of covariates. By rich structure we mean the following in this context:  
+  
+  - data covering for **19** separate units (pv solar panels) over 13 months (04/2018 - 05/2019) 
+  - outcome variable with high temporal resolution (15 min)
+  - (categorical) cloud cover covariate with relatively high temporal and spatial resolution (hourly panel specific cloud cover forecasts)
+  - measurement error in the cloud cover covariate 
+  - cyclical nature of the outcome variable (both in terms of its level and scale but this can probably be addressed by the use of the deterministic irradiation covariate).  
+
+In order to exploit the data structure outlined above, multilevel models with many parameters, perhaps even with a nested structure should be used. One increasingly popular choice for these kind of problems is Bayesian MLMs and the use of flexible and scalable computational softwares like Stan.
+
+
+## Data exploration
+
+```{r, message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+pv_panel_data = readRDS("C:/Users/kadara/Desktop/stancon/data/pv_panel_data.rds")
+```
+
+
+Subset of data for plotting
+```{r}
+all_starts = data.frame(start = seq(ymd_hms(min(pv_panel_data$start)), ymd_hms(max(pv_panel_data$start)), by = "15 min"),
+                        stringsAsFactors = F)
+
+data2plot = pv_panel_data %>% 
+  filter(id == "3") %>% 
+  mutate(start = ymd_hms(start)) %>% 
+  right_join(all_starts)
+```
+
+
+### Production and irradiation (scaled by capacity)
+```{r}
+library(scales)
+data2plot %>% 
+  filter(start > "2018-04-12" & start < "2018-04-20") %>%
+  ggplot() +
+  geom_line(aes(x = ymd_hms(start, tz = "CET"), y = y)) +
+  scale_x_datetime(labels = date_format("%Y.%m.%d")) +
+  geom_line(aes(x = ymd_hms(start, tz = "CET"), y = nIrr * cap), color = "red") +
+  ylim(0, 500)
+
+```
+
+### Simple summaries  
+daily sum of production & monthly max of daily sum production.
+```{r}
+
+daily_sum = data2plot %>% 
+  filter(!is.na(id)) %>% 
+  mutate(date = as.Date(as.character(start))) %>% 
+  group_by(id, date) %>% 
+  summarize(daily_sum = max(y, na.rm= T)) 
+
+monthly_max = daily_sum %>% 
+  mutate(month = month(ymd(date))) %>% 
+  group_by(id, month) %>% 
+  summarize(monthly_max = max(daily_sum, na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+```{r}
+daily_sum %>% head(5)
+```
+
+```{r}
+monthly_max
+```
+
+
+### Irradiation vs. Production on two clear days + regression line superimposed
+
+```{r}
+data2plot %>% 
+  filter(start > "2018-04-18" & start < "2018-04-20") %>%
+  ggplot() +
+  geom_point(aes(x = nIrr, y = y, color = as.Date(start))) +
+  stat_smooth(aes(x = nIrr, y = y), method = "lm")
+
+```
+
+### Irradiation vs. Production by morning/afternoon 
++ regression line superimposed
+ 
+```{r}
+data2plot %>% 
+  filter(start > "2018-04-18" & start < "2018-04-20") %>%
+  mutate(morning = ifelse(hour(ymd_hms(start, tz = "CET")) < 13, 1, 0)) %>% 
+  ggplot() +
+  geom_point(aes(x = nIrr, y = y, color = as.factor(morning))) +
+  stat_smooth(aes(x = nIrr, y = y), method = "lm")
+
+```
+
+
+### Irradiation vs. Production on several clear days 
++ regression line superimposed
+
+```{r}
+
+daily_sum_abs_error = data2plot %>% 
+  mutate(date = as.Date(as.character(start)),
+         nIrr_scaled = nIrr * cap) %>% 
+  group_by(date) %>% 
+  summarise(sum_y = sum(y, na.rm = T),
+            sum_nIrr_scaled = sum(nIrr_scaled, na.rm = T)) %>% 
+  mutate(sum_abs_p_error = abs(sum_y - sum_nIrr_scaled)/sum_nIrr_scaled) %>% 
+  ungroup()
+
+data2plot %>% 
+  filter(!is.na(id)) %>% 
+  mutate(date = as.Date(as.character(start))) %>% 
+  inner_join(daily_sum_abs_error %>% select(date, sum_abs_p_error)) %>% 
+  filter(sum_abs_p_error < 0.2) %>% 
+  
+  ggplot(aes(x = nIrr, y = y, color = as.factor(date))) +
+  geom_point(alpha = 0.5) +
+  stat_smooth(aes(x = nIrr, y = y), formula = y ~ x - 1, method = "lm", color = "black") +
+  theme(legend.position = "none")
+
+```
+
+### Irradiation vs. Production by morning/afternoon on several clear days 
++regression line superimposed
+
+```{r}
+data2plot %>% 
+  filter(!is.na(id)) %>% 
+  mutate(date = as.Date(as.character(start)),
+         morning = as.factor(ifelse(hour(ymd_hms(start, tz = "CET")) < 12, 1, 0))) %>% 
+  inner_join(daily_sum_abs_error %>% select(date, sum_abs_p_error)) %>% 
+  filter(sum_abs_p_error < 0.2) %>% 
+  
+  ggplot(aes(x = nIrr, y = y, color = morning)) +
+  geom_point(alpha = 0.3) +
+  scale_color_manual(values = c("0" = "deeppink", "1" = "orange")) +
+  geom_smooth(formula = y ~ x - 1, method = "lm")
+
+```
+
+### Production distribution
+
+**By hour**
+```{r}
+library(ggridges)
+library(viridis)
+
+p1 = pv_panel_data %>% 
+  filter(nIrr > 0.1) %>% 
+  mutate(hour = hour(round_date(ymd_hms(start, tz = "CET"), unit = "hour"))) %>% 
+  #filter(hour > 8 & hour < 18) %>% 
+  ggplot(aes(x = y/cap, y = as.factor(hour), fill = ..x..)) +
+  #geom_density_ridges() +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.05) +
+  scale_fill_viridis(name = "y", option = "C") +
+  theme(legend.position = "none") +
+  labs(subtitle = "Production/Capacity") +
+  theme(plot.subtitle = element_text(size = 8)) +
+  ylab("Hour") +
+  xlab("") +
+  xlim(0, 2)
+
+p2 = pv_panel_data %>% 
+  filter(nIrr > 0.1) %>% 
+  mutate(hour = hour(round_date(ymd_hms(start, tz = "CET"), unit = "hour"))) %>% 
+  #filter(hour > 8 & hour < 18) %>% 
+  ggplot(aes(x = y/(cap*nIrr), y = as.factor(hour), fill = ..x..)) +
+  #geom_density_ridges() +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.1) +
+  scale_fill_viridis(name = "y", option = "C") +
+  theme(legend.position = "none") +
+  labs(subtitle = "Production/(Capacity*Irradiation)") +
+  theme(plot.subtitle = element_text(size = 8)) +
+  ylab("Hour") +
+  xlab("") +
+  xlim(0, 2)
+
+library(gridExtra)
+grid.arrange(p1, p2, nrow = 1, top = "Empirical distribution of pv energy production by hour groupings")
+
+```
+
+**By cloud forecast**
+```{r}
+
+p1 = pv_panel_data %>% 
+  filter(nIrr > 0.1) %>% 
+  filter(!is.na(x)) %>% 
+  #mutate(hour = hour(round_date(ymd_hms(start, tz = "CET"), unit = "hour"))) %>% 
+  #filter(hour > 8 & hour < 18) %>% 
+  ggplot(aes(x = y/cap, y = reorder(as.factor(xCat),x), fill = ..x..)) +
+  #geom_density_ridges() +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.05) +
+  scale_fill_viridis(name = "y", option = "C") +
+  theme(legend.position = "none") +
+  labs(subtitle = "Production/Capacity") +
+  ylab("Cloud category (r1:full cloudy - r10:clear sky)") +
+  xlab("") +
+  theme(plot.subtitle = element_text(size = 8),
+        axis.title.y = element_text(size = 8)) +
+  xlim(0, 2)
+
+p2 = pv_panel_data %>% 
+  filter(nIrr > 0.1) %>% 
+  filter(!is.na(x)) %>% 
+  #mutate(hour = hour(round_date(ymd_hms(start, tz = "CET"), unit = "hour"))) %>% 
+  #filter(hour > 8 & hour < 18) %>% 
+  ggplot(aes(x = y/(cap*nIrr), y = reorder(as.factor(xCat),x), fill = ..x..)) +
+  #geom_density_ridges() +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.05) +
+  scale_fill_viridis(name = "y", option = "C") +
+  theme(legend.position = "none") +
+  labs(subtitle = "Production/(Capacity*Irradiation)") +
+  theme(plot.subtitle = element_text(size = 8)) +
+  ylab("") +
+  xlab("") +
+  xlim(0, 2)
+
+grid.arrange(p1, p2, nrow = 1, top = "Empirical distribution of pv energy production by cloud categories")
+
+```
+
+### Insights from exploration
+
+After the visual exploration we gained some additional insights about our dataset.
+
+  1. The distribution of the outcome variable is highly bimodal despite making the trivial clusterings (e.g. split by cloud cover estimates). This means that the information provided by the covariates will be not enough to break the multimodality inherent to the outcome. Nevertheless, we will presumably need to address this problem for getting reliable posterior estimates of the unknown quantities of interest.   
+  2. One form of this multimodality is the abundance of zeros in the outcome. This is not an isolated feature of the outcome and we at least have a proxy for the covariate mainly responsible for this phenomenon (cloud cover). But due to the fact that this proxy is measured with error (it is a forecast) we may need to address "zero-inflation" additionally/separately in our chosen model specifications.      
+  3. The relationship between the (deterministically) calculated irradiation and production may be linear but the effect seems to be varying along the following groupings:  
+    - morning vs. afternoon  
+  4. On the contrary, there are also signs for the relationship being non-linear. If we eventually examine this possibility then we shall do the analysis along the following insights:  
+    - at low irradiance levels the linear assumption overestimates the true relationship;  
+    - while at higher irradiance levels the linear assumption underestimates the true relationship;  
+    - this seems to be true mainly in the afternoon so probably unmodeled structural effects related to the physical phenomenon may play an important role here.  
+  5. We should consider getting rid of the annual and daily cyclical effects inherent to the outcome (both in terms of its level and scale) and partly visible in the plot titled "Empirical distribution of pv energy production by hour groupings".  
+     As it became clear from the same plot, normalizing the outcome with the deterministic irradiance measure can successfully address this problem.  
+
+### Final data manipulations before modeling
+
+1. We normalize the outcome by the deterministic irradiance measure.  
+2. This also means that we settle with assuming a linear relationship between the outcome and the irradiance.
+3. We create a morning dummy to possibly account for the visually detected part-of-the-day effect discussed above.  
+4. We recode the cloud cover forecast covariate to only distinguish 3 levels of cloud cover (full cloudy, mid cloudy, clear).  
+5. We eliminate those observations when the normalized irradiation is below 0.1. The rationale to do this is that in those periods the share of the indirect radiation in total irradiation is much higher than normally and presumably different causal relationships apply. Some authors have similar benchmarks for this, see e.g. (*clear sky index*).  
+
+```{r}
+
+data2model = pv_panel_data %>% 
+  filter(nIrr > 0.1) %>% 
+  filter(!is.na(xCat)) %>% 
+  mutate(yNorm = y/(cap*nIrr),
+         yCap = y/cap) %>% 
+  mutate(morning = ifelse(hour(ymd_hms(start, tz = "CET")) < 13, 1, 0)) %>% 
+  mutate(xCat3 = case_when(xCat == "r1" ~ "full",
+                           xCat %in% c("r9", "r10") ~ "none",
+                           TRUE ~ "mid"),
+         xDumFull = ifelse(xCat3 == "full",  1, 0),
+         xDumMid = ifelse(xCat3 == "mid", 1, 0))
+
+```
+
+
+## Models and methodology
+
+In this notebook and at this stage of model development we will only deal with standard model specifications that can be fit via the well-known Stan interface, brms. **We also heavily relied on some great materials about brms and mixed effects modeling in general listed in the references section.** In future work more custom models will probably be required and coded. The possible extensions and new directions of analyses are discussed in detail at the end of this notebook. 
+
+### General assumptions about the likelihood model
+
+As it was already mentioned before we do not closely approximate the possible physical processes related to pv solar energy production. That said, the likelihood model is more of a statistical approximation than the reflection of the (true) data generating process. Nevertheless, the following specification of the likelihood model includes some simple theoretical considerations relevant to the phenomenon discussed in this notebook.  
+  
+The general form of the likelihood will be the following:  
+let $yNorm_{t}$ be the normalized production at the $t$-th time period prevalent in some $z$ cluster. In this specification $z$ is a unique subset of any combination of the following possible grouping factors: part of the day (morning/afternoon), panel, cloud category. 
+
+$$yNorm_{t} = \Gamma_{z[t]} * (1 - \theta_{z[t]}) + \epsilon_{z[t]}$$
+
+### Model 1
+
+Normal model of normalized production pooled over all the panels.
+
+Full specification:  
+
+$$yNorm_{t} \sim \mathcal{N}(\mu_{t}, \sigma_e)$$
+$$\mu_{t} = \Gamma * (1 - (\alpha + \beta_{c[t]} + \beta_{m[t]})) $$
+$$\Gamma \sim \mathcal{N}(1, \sigma_\gamma)$$
+
+
+<span style="color:red">$$\alpha \sim \mathcal{N}(0, 1) \space\space\space\space | \space\space\space\space \alpha = 0 \space\space\space\space ???$$</span>
+
+$$\beta_{c} \sim \mathcal{N}(0, \sigma_c)$$
+$$\beta_{m} \sim \mathcal{N}(0, \sigma_{m})$$
+
+$$\sigma_e \sim \mathcal{N^+}(0, 1)$$
+$$\sigma_c \sim \mathcal{N^+}(0, 1)$$
+$$\sigma_m \sim \mathcal{N^+}(0, 1)$$
+
+where **$\alpha$ is a population (fixed) effect representing **, $\beta_c$ and $\beta_m$ are random effects corresponding to the cloud category and part-of-the-day clusters, respectively.
+
+Implementation in brms.  
+
+Subset of data.
+```{r}
+set.seed(4534)
+subset2model = data2model %>% mutate(yNorm2 = yNorm + 0.01) %>% filter(id == 3) %>% slice(sample(1:n(), 2000))
+
+```
+
+```{r}
+library(brms)
+
+formula1 <- bf(
+  yNorm ~ gamma * (1 - theta),
+  theta ~ 0 + (1|xCat3),
+  gamma ~ 1,
+  nl = TRUE)
+
+formula1 <- bf(
+  yNorm2 ~ 1 + (1|xCat3),
+  #theta ~ 0 + (1|xCat3),
+  #gamma ~ 1,
+  nl = F)
+
+get_prior(formula1,
+          data = subset2model, family =gaussian())
+
+prior <- get_prior(formula1,
+                   data = subset2model, 
+                   family = lognormal())
+prior$prior[c(1)] <- "normal(1, 0.01)"
+#prior$prior[c(3)] <- "normal(1, 0.2)"
+#prior$prior[c(4)] <- "normal(0, 0.2)"
+#prior$prior[c(8)] <- "normal(0, 0.2)"
+#prior$prior[c(8)] <- "normal(0, 0.2)"
+prior
+
+fit1 <- brm(formula = formula1, 
+            data = subset2model, 
+            family = lognormal(),
+            prior = prior,
+            warmup = 500, iter = 1000,
+            control = list(adapt_delta = 0.95))
+
+```
+
+Results
+
+```{r}
+make_stancode(formula = formula1, 
+            data = subset2model, 
+            family = lognormal(),
+            prior = prior)
+
+summary(fit1)
+plot(fit1)
+```
+
+Marginal effects
+```{r}
+
+plot(marginal_effects(fit1), ask = FALSE)
+plot(marginal_effects(fit1), 
+     points = TRUE)
+
+```
+
+Diagnostics
+
+```{r}
+
+library("bayesplot")
+rhats <- bayesplot::rhat(fit1)
+p_rhat = mcmc_rhat(rhats) + yaxis_text(hjust = 1)
+neffs <- bayesplot::neff_ratio(fit1)
+p_neff = mcmc_neff(neffs) + yaxis_text(hjust = 1)
+
+grid.arrange(p_rhat, p_neff, nrow = 2)
+
+```
+
+```{r}
+posterior1 <- as.array(fit1)
+np1 <- nuts_params(fit1)
+# 
+# color_scheme_set("darkgray")
+# mcmc_parcoord(posterior1, np = np1)
+
+mcmc_pairs(posterior1, np = np1,
+           off_diag_args = list(size = 0.75))
+# mcmc_pairs(posterior1, np = np1, pars = c("sd_xCat3__theta_Intercept", "r_xCat3__theta[none,Intercept]", "r_xCat3__theta[mid,Intercept]", "r_xCat3__theta[full,Intercept]", "b_gamma_Intercept", "sigma"),
+#            off_diag_args = list(size = 0.75))
+```
+```{r}
+pp_check(fit1)
+```
+
+Re-fit with tighter/more sensible priors for the random effects' standard deviations.
+
+```{r}
+prior2 <- get_prior(formula1,
+                   data = subset2model, 
+                   family = gaussian())
+# prior$prior[1] <- "normal(0,1)"
+# prior$prior[2] <- "normal(0,1)"
+prior2$prior[c(1,2,3,4,5,6,7)] <- "normal(0,0.1)"
+prior2
+
+fit2 <- brm(formula = formula1, 
+            data = subset2model, 
+            family = gaussian(),
+            prior = prior2,
+            warmup = 500, iter = 1000,
+            control = list(adapt_delta = 0.95))
+```
+
+```{r}
+
+library("bayesplot")
+rhats <- bayesplot::rhat(fit2)
+p_rhat = mcmc_rhat(rhats) + yaxis_text(hjust = 1)
+neffs <- bayesplot::neff_ratio(fit1)
+p_neff = mcmc_neff(neffs) + yaxis_text(hjust = 1)
+
+grid.arrange(p_rhat, p_neff, nrow = 2)
+```
+
+```{r}
+posterior2 <- as.array(fit2)
+np2 <- nuts_params(fit2)
+# 
+# color_scheme_set("darkgray")
+# mcmc_parcoord(posterior1, np = np1)
+
+mcmc_pairs(posterior2, np = np2, pars = c("sd_xCat3__Intercept", "r_xCat3[none,Intercept]", "r_xCat3[mid,Intercept]", "r_xCat3[full,Intercept]", "b_morning", "b_Intercept", "sigma"),
+           off_diag_args = list(size = 0.75))
+```
+```{r}
+plot(fit2)
+
+```
+
+
+
+### Model 2
+
+Pooled beta regression of production relative to capacity.
+
+$$y_{it}/cap_{it} = IRR_{it} * (\alpha_i + \beta_{ic} + \gamma_{im}) + \epsilon_{it}$$
+$$\epsilon_{it} \sim \mathcal{N}(\mu_{it}, \sigma_{it})$$
+
+```{r}
+formula2 <- bf(
+  (yCap - 1) ~ morning + (1|xCat3) + (1 + morning|id) + (1|xCat3:id),
+  #theta ~ 1 + morning,
+  nl = FALSE)
+
+get_prior(formula2,
+          data = subset2model, family = gaussian())
+
+prior <- get_prior(formula2,
+                   data = subset2model, 
+                   family = gaussian())
+# prior$prior[1] <- "normal(0,1)"
+# prior$prior[2] <- "normal(0,1)"
+prior$prior[c(1,2,3,4,5,6,7)] <- "normal(0,1)"
+prior
+
+fit1 <- brm(formula = formula1, 
+            data = subset2model, 
+            family = gaussian(),
+            prior = prior,
+            warmup = 500, iter = 1000,
+            control = list(adapt_delta = 0.95))
+```
+
+
+
+### Model 3
+
+Hierarchical beta regression of production relative to capacity.
+
+$$y_{it}/cap_{it} = IRR_{it} * (\alpha_i + \beta_{ic} + \gamma_{im}) + \epsilon_{it}$$
+$$\epsilon_{it} \sim \mathcal{N}(\mu_{it}, \sigma_{it})$$
+
+## Results
+## Scoring
+
+```{r}
+loo()
+```
+
+  
+## Future work
+
+Several possible viable extensions exist. Let's assume that the basic structure of the data will remain the same (same type of covariates - e.g. cloud cover with measurement error). In this case - without the desire to give a complete list of possible modifications - the following **possible improvement areas** should be considered in the next round of model development:
+  
+  - give a reliable approximation for the physical process and DGP;
+  - give a probabilistic estimation for the solar irradiation intensity or somehow treat it as endogenous;   
+  - formally take the erroneous nature of the cloud cover covariate into account;
+  - incorporate multiple forecaster's cloud cover predictions into one common model;
+  - relax other simplifying assumptions made in advance (e.g. ignorance of panel specific physical parameters);
+  - make evaluation based on different cost functions more relevant to the exact business need.
+  
+  
+On the modelling side a possible move forward would be to assume different data generating processes based on the true (but unobserved) cloudiness of each time period. In order to do this the following model specifications shall be examined:
+  
+  - a finite mixture model or a hidden Markov-model to explicitly model unobserved cloudiness and address the problem of the covariates being measured with error (no prior information about the m.e. process);
+  - a multiple annotator (Dawid-Skene type) model in case multiple forecasters' cloud forecasts are available;
+  - combination of the two in order to simultaneously i) determine the true latent cloudiness levels (states), ii) assess forecaster reliability and iii) fit different DGP-s for each latent state.
+
+
+
+
+
+
+
